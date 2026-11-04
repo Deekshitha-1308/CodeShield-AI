@@ -11,6 +11,20 @@ RULES = [
     (r'\b(?:password|api_key|secret)\s*=\s*[\'"][^\'"]{4,}[\'"]',
      "High", "Secrets", "Move secrets to environment variables or a secret manager; rotate exposed credentials."),
     (r'\bassert\s+', "Low", "Reliability", "Do not use assert for input validation; assertions can be disabled."),
+    (r'\bos\.system\s*\(', "High", "Security",
+     "Avoid os.system() with user-controlled input. Use safer subprocess methods with validated arguments."),
+    # Additional security rules
+    (r'\bverify\s*=\s*False\b', "High", "Security",
+     "TLS certificate verification is disabled. Enable certificate verification."),
+
+    (r'\btempfile\.mktemp\s*\(', "High", "Security",
+     "Avoid tempfile.mktemp(). Use safer temporary-file creation methods."),
+
+    (r'\b(?:hashlib\.)?(?:md5|sha1)\s*\(', "Medium", "Security",
+     "MD5 and SHA1 are unsuitable for security-sensitive hashing. Use an appropriate modern algorithm."),
+
+    (r'\byaml\.load\s*\(', "High", "Security",
+     "Review YAML loading. Use yaml.safe_load() for untrusted YAML."),
 ]
 
 def analyze_code(code: str):
@@ -55,6 +69,97 @@ def analyze_code(code: str):
         return sorted(findings, key=lambda x: (["Critical","High","Medium","Low","Info"].index(x["severity"]), x["line"]))
 
     for node in ast.walk(tree):
+        # 1. Detect unsafe subprocess shell execution
+        if isinstance(node, ast.Call):
+            func = node.func
+            func_name = ""
+
+            if isinstance(func, ast.Name):
+                func_name = func.id
+            elif isinstance(func, ast.Attribute):
+                if isinstance(func.value, ast.Name):
+                    func_name = func.value.id + "." + func.attr
+
+            if func_name in ("subprocess.run", "subprocess.call",
+                             "subprocess.Popen"):
+                for kw in node.keywords:
+                    if (kw.arg == "shell" and
+                            isinstance(kw.value, ast.Constant) and
+                            kw.value.value is True):
+                        add(node.lineno, "High", "Security",
+                            "Subprocess is configured with shell=True.",
+                            ast.get_source_segment(code, node) or "subprocess call",
+                            "Avoid shell=True where possible. Pass validated arguments as a list.")
+
+            # 2. Detect HTTP requests without timeout
+            if func_name in (
+                "requests.get", "requests.post",
+                "requests.put", "requests.delete",
+                "requests.patch"
+            ):
+                if not any(kw.arg == "timeout" for kw in node.keywords):
+                    add(node.lineno, "Medium", "Reliability",
+                        "HTTP request has no timeout configured.",
+                        ast.get_source_segment(code, node) or "HTTP request",
+                        "Set a reasonable timeout to prevent indefinite waiting.")
+
+            # 3. Detect potentially unsafe YAML loading
+            if func_name == "yaml.load":
+                loader = next(
+                    (kw.value for kw in node.keywords
+                     if kw.arg == "Loader"),
+                    None
+                )
+
+                safe_loader = (
+                    isinstance(loader, ast.Name)
+                    and loader.id in ("SafeLoader", "CSafeLoader")
+                ) or (
+                    isinstance(loader, ast.Attribute)
+                    and loader.attr in ("SafeLoader", "CSafeLoader")
+                )
+
+                if not safe_loader:
+                    add(node.lineno, "High", "Security",
+                        "YAML is loaded without a recognized safe loader.",
+                        ast.get_source_segment(code, node) or "yaml.load()",
+                        "Use yaml.safe_load() when processing untrusted YAML.")
+
+            # 4. Detect weak hashing functions
+            if func_name in (
+                "hashlib.md5", "hashlib.sha1", "md5", "sha1"
+            ):
+                add(node.lineno, "Medium", "Security",
+                    "Weak hashing algorithm detected.",
+                    ast.get_source_segment(code, node) or func_name,
+                    "Use a modern hash algorithm for security-sensitive applications.")
+
+            # 5. Detect unsafe temporary filename creation
+            if func_name == "tempfile.mktemp":
+                add(node.lineno, "High", "Security",
+                    "Unsafe temporary filename creation detected.",
+                    ast.get_source_segment(code, node) or func_name,
+                    "Use tempfile.NamedTemporaryFile() or another secure temporary-file API.")
+
+        # 6. Detect mutable default function arguments
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defaults = node.args.defaults + [
+                d for d in node.args.kw_defaults if d is not None
+            ]
+
+            for default in defaults:
+                if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                    add(node.lineno, "Medium", "Bug",
+                        "Mutable default argument detected.",
+                        f"Function: {node.name}",
+                        "Use None as the default and create a new collection inside the function.")
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+                if isinstance(node.right, ast.Constant) and node.right.value == 0:
+                    add(node.lineno, "High", "Bug",
+                        "Division or modulo by zero detected.",
+                        ast.get_source_segment(code, node) or "division by zero",
+                        "Check that the divisor is not zero before performing the operation.")
         if isinstance(node, ast.FunctionDef) and len(node.args.args) > 6:
             add(node.lineno, "Low", "Maintainability",
                 f"Function '{node.name}' has many parameters.",
